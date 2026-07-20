@@ -22,7 +22,7 @@ from lib.utils import (
     CustomJSONEncoder,
 )
 from lib.metrics import RMSE_MAE_MAPE
-from lib.data_prepare import get_dataloaders_from_index_data
+from lib.lazy_data_prepare import get_dataloaders_from_index_data
 from model.STAEformer import STAEformer
 
 # ! X shape: (B, T, N, C)
@@ -219,7 +219,7 @@ if __name__ == "__main__":
     parser.add_argument("-g", "--gpu_num", type=int, default=0)
     args = parser.parse_args()
 
-    seed = torch.randint(1000, (1,)) # set random seed here
+    seed = 42 # set random seed here
     seed_everything(seed)
     set_cpu_num(1)
 
@@ -279,7 +279,7 @@ if __name__ == "__main__":
 
     if dataset in ("METRLA", "PEMSBAY"):
         criterion = MaskedMAELoss()
-    elif dataset in ("PEMS03", "PEMS04", "PEMS07", "PEMS08"):
+    elif dataset in ("PEMS03", "PEMS04", "PEMS07", "PEMS08", "SD"):
         criterion = nn.HuberLoss()
     else:
         raise ValueError("Unsupported dataset.")
@@ -294,7 +294,6 @@ if __name__ == "__main__":
         optimizer,
         milestones=cfg["milestones"],
         gamma=cfg.get("lr_decay_rate", 0.1),
-        verbose=False,
     )
 
     # --------------------------- print model structure -------------------------- #
