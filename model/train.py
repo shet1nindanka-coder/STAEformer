@@ -1,4 +1,5 @@
 import argparse
+from contextlib import nullcontext
 import copy
 import datetime
 import json
@@ -37,6 +38,18 @@ from model.STAEformer import STAEformer  # noqa: E402
 # X shape: (B, T, N, C)
 DEVICE = torch.device("cpu")
 SCALER = None
+AMP_ENABLED = False
+GRAD_SCALER = None
+
+
+def _amp_context():
+    """Enable FP16 autocast only when CUDA AMP is active."""
+    if AMP_ENABLED:
+        return torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+        )
+    return nullcontext()
 
 
 def _move_batch_to_device(x_batch, y_batch):
@@ -66,10 +79,12 @@ def eval_model(model, valset_loader, criterion, epoch, max_epochs):
     for batch_number, (x_batch, y_batch) in enumerate(progress, start=1):
         x_batch, y_batch = _move_batch_to_device(x_batch, y_batch)
 
-        out_batch = model(x_batch)
-        out_batch = SCALER.inverse_transform(out_batch)
+        with _amp_context():
+            out_batch = model(x_batch)
 
-        loss = criterion(out_batch, y_batch)
+        # Keep inverse scaling and the loss in FP32 for numerical stability.
+        out_batch = SCALER.inverse_transform(out_batch.float())
+        loss = criterion(out_batch, y_batch.float())
         batch_loss_list.append(loss.item())
 
         if batch_number % 20 == 0 or batch_number == len(valset_loader):
@@ -111,10 +126,12 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        out_batch = model(x_batch)
-        out_batch = SCALER.inverse_transform(out_batch)
+        with _amp_context():
+            out_batch = model(x_batch)
 
-        loss = criterion(out_batch, y_batch)
+        # Keep inverse scaling and the loss in FP32 for numerical stability.
+        out_batch = SCALER.inverse_transform(out_batch.float())
+        loss = criterion(out_batch, y_batch.float())
 
         if not torch.isfinite(loss):
             raise FloatingPointError(
@@ -122,15 +139,18 @@ def train_one_epoch(
                 f"{loss.item()}"
             )
 
-        loss.backward()
+        GRAD_SCALER.scale(loss).backward()
 
         if clip_grad:
+            # Gradients must be unscaled before gradient clipping.
+            GRAD_SCALER.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 max_norm=clip_grad,
             )
 
-        optimizer.step()
+        GRAD_SCALER.step(optimizer)
+        GRAD_SCALER.update()
         batch_loss_list.append(loss.item())
 
         if batch_number % 20 == 0 or batch_number == len(trainset_loader):
@@ -181,8 +201,11 @@ def calculate_streaming_metrics(model, loader, description):
     for batch_number, (x_batch, y_batch) in enumerate(progress, start=1):
         x_batch, y_batch = _move_batch_to_device(x_batch, y_batch)
 
-        y_pred = model(x_batch)
-        y_pred = SCALER.inverse_transform(y_pred)
+        with _amp_context():
+            y_pred = model(x_batch)
+
+        y_pred = SCALER.inverse_transform(y_pred.float())
+        y_batch = y_batch.float()
 
         mask = y_batch != 0
         abs_error = torch.abs(y_pred - y_batch)
@@ -503,7 +526,7 @@ def test_model(model, testset_loader, log=None):
 
 
 def main():
-    global DEVICE, SCALER
+    global DEVICE, SCALER, AMP_ENABLED, GRAD_SCALER
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--dataset", type=str, default="pems08")
@@ -518,6 +541,12 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     DEVICE = torch.device(
         "cuda:0" if torch.cuda.is_available() else "cpu"
+    )
+
+    AMP_ENABLED = DEVICE.type == "cuda"
+    GRAD_SCALER = torch.amp.GradScaler(
+        "cuda",
+        enabled=AMP_ENABLED,
     )
 
     dataset = args.dataset.upper()
@@ -573,6 +602,10 @@ def main():
                 log=log,
             )
 
+        print_log(
+            f"AMP FP16: {'enabled' if AMP_ENABLED else 'disabled'}",
+            log=log,
+        )
         print_log(dataset, log=log)
 
         (
