@@ -248,7 +248,7 @@ SD:
 
   lr_decay_rate: 0.1
 
-  batch_size: 8
+  batch_size: 16
   max_epochs: 20
   early_stop: 15
 
