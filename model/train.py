@@ -42,6 +42,13 @@ AMP_ENABLED = False
 GRAD_SCALER = None
 
 
+def _unwrap_model(model):
+    """Return the underlying model when DataParallel is enabled."""
+    if isinstance(model, nn.DataParallel):
+        return model.module
+    return model
+
+
 def _amp_context():
     """Enable FP16 autocast only when CUDA AMP is active."""
     if AMP_ENABLED:
@@ -392,7 +399,7 @@ def train(
             wait = 0
             min_val_loss = val_loss
             best_epoch = epoch
-            best_state_dict = copy.deepcopy(model.state_dict())
+            best_state_dict = copy.deepcopy(_unwrap_model(model).state_dict())
 
             if save:
                 torch.save(best_state_dict, save)
@@ -440,7 +447,7 @@ def train(
     if best_state_dict is None:
         raise RuntimeError("Training finished without a valid model state.")
 
-    model.load_state_dict(best_state_dict)
+    _unwrap_model(model).load_state_dict(best_state_dict)
 
     total_training_seconds = time.time() - total_training_start
 
@@ -530,15 +537,22 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--dataset", type=str, default="pems08")
-    parser.add_argument("-g", "--gpu_num", type=int, default=0)
+    parser.add_argument(
+        "-g",
+        "--gpu_num",
+        type=str,
+        default="0,1",
+        help='Visible GPU IDs, for example "0,1".',
+    )
     args = parser.parse_args()
 
     seed = 42
     seed_everything(seed)
     set_cpu_num(1)
 
-    gpu_id = args.gpu_num
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    gpu_ids = args.gpu_num
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+
     DEVICE = torch.device(
         "cuda:0" if torch.cuda.is_available() else "cpu"
     )
@@ -565,6 +579,14 @@ def main():
     cfg = all_config[dataset]
 
     model = STAEformer(**cfg["model_args"])
+    model = model.to(DEVICE)
+
+    if DEVICE.type == "cuda" and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(
+            model,
+            device_ids=list(range(torch.cuda.device_count())),
+            output_device=0,
+        )
 
     now = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
@@ -598,10 +620,24 @@ def main():
 
         if DEVICE.type == "cuda":
             print_log(
-                f"GPU: {torch.cuda.get_device_name(0)}",
+                f"Visible GPUs: {torch.cuda.device_count()}",
                 log=log,
             )
+            for gpu_index in range(torch.cuda.device_count()):
+                print_log(
+                    f"GPU {gpu_index}: {torch.cuda.get_device_name(gpu_index)}",
+                    log=log,
+                )
 
+        print_log(
+            "Multi-GPU: "
+            + (
+                f"DataParallel on {torch.cuda.device_count()} GPUs"
+                if isinstance(model, nn.DataParallel)
+                else "disabled"
+            ),
+            log=log,
+        )
         print_log(
             f"AMP FP16: {'enabled' if AMP_ENABLED else 'disabled'}",
             log=log,
@@ -663,7 +699,7 @@ def main():
 
         print_log(
             summary(
-                model,
+                _unwrap_model(model),
                 [
                     cfg["batch_size"],
                     cfg["in_steps"],
