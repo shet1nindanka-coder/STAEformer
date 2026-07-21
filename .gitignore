@@ -141,3 +141,22 @@ nohup.out
 .idea/
 run_nohup.sh
 logs/
+
+# macOS
+.DS_Store
+
+# Датасеты, которые создаёт ноутбук
+data/SD/*.npz
+data/SD/*.csv
+
+# Результаты обучения
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+logs/
+
+# Python/Jupyter
+__pycache__/
+.ipynb_checkpoints/
