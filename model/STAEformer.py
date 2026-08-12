@@ -1,5 +1,7 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from torchinfo import summary
 
 
@@ -18,6 +20,10 @@ class AttentionLayer(nn.Module):
 
     """
 
+    # CUDA caps gridDim.y / gridDim.z at 65535, and the fused SDPA kernels map the
+    # leading batch dimension onto one of them. Stay safely below the limit.
+    MAX_FUSED_BATCH = 32768
+
     def __init__(self, model_dim, num_heads=8, mask=False):
         super().__init__()
 
@@ -33,10 +39,20 @@ class AttentionLayer(nn.Module):
 
         self.out_proj = nn.Linear(model_dim, model_dim)
 
+    def _split_heads(self, tensor, length):
+        """(..., length, model_dim) -> (prod(leading_dims), num_heads, length, head_dim)
+
+        Heads are taken as contiguous slices of the last axis, so head `h` owns
+        channels [h * head_dim : (h + 1) * head_dim] -- identical to the previous
+        `torch.split(t, head_dim, dim=-1)` implementation.
+        """
+        tensor = tensor.reshape(-1, length, self.num_heads, self.head_dim)
+        return tensor.transpose(1, 2)
+
     def forward(self, query, key, value):
         # Q    (batch_size, ..., tgt_length, model_dim)
         # K, V (batch_size, ..., src_length, model_dim)
-        batch_size = query.shape[0]
+        leading_shape = query.shape[:-2]  # (batch_size, ...)
         tgt_length = query.shape[-2]
         src_length = key.shape[-2]
 
@@ -44,30 +60,58 @@ class AttentionLayer(nn.Module):
         key = self.FC_K(key)
         value = self.FC_V(value)
 
-        # Qhead, Khead, Vhead (num_heads * batch_size, ..., length, head_dim)
-        query = torch.cat(torch.split(query, self.head_dim, dim=-1), dim=0)
-        key = torch.cat(torch.split(key, self.head_dim, dim=-1), dim=0)
-        value = torch.cat(torch.split(value, self.head_dim, dim=-1), dim=0)
+        # (..., length, model_dim) -> (batch, num_heads, length, head_dim)
+        query = self._split_heads(query, tgt_length)
+        key = self._split_heads(key, src_length)
+        value = self._split_heads(value, src_length)
 
-        key = key.transpose(
-            -1, -2
-        )  # (num_heads * batch_size, ..., head_dim, src_length)
+        # The fast SDPA kernels (flash / mem-efficient) require head_dim to be a
+        # multiple of 8. STAEformer's default is 152/4 = 38, which disqualifies them
+        # and silently falls back to the `math` backend -- which materialises the
+        # full (..., N, N) score matrix and defeats the whole point.
+        #
+        # Zero-padding head_dim up to the next multiple of 8 is exact:
+        #   * padded Q/K contribute 0 to every dot product -> scores unchanged;
+        #   * padded V produces zero output channels, which we slice off.
+        # `scale` must stay tied to the TRUE head_dim, not the padded one.
+        pad = (-self.head_dim) % 8
+        if pad:
+            query = F.pad(query, (0, pad))
+            key = F.pad(key, (0, pad))
+            value = F.pad(value, (0, pad))
 
-        attn_score = (
-            query @ key
-        ) / self.head_dim**0.5  # (num_heads * batch_size, ..., tgt_length, src_length)
+        # Fused attention: the (..., tgt_length, src_length) score matrix is never
+        # materialised, so memory is linear in sequence length instead of quadratic.
+        # Dropout stays 0.0 here: STAEformer applies dropout *after* attention
+        # (SelfAttentionLayer.dropout1), not on the attention weights.
+        #
+        # The fused kernels map the leading (batch) dimension onto a CUDA grid axis
+        # capped at 65535. Temporal attention folds num_nodes into that dimension
+        # (batch * num_nodes), which overflows on large graphs -- e.g. CA with
+        # 8600 nodes at batch 8 gives 68800 and fails with
+        # `CUDA error: invalid configuration argument`. Chunking is exact: samples
+        # in the leading dimension never attend to each other.
+        chunks = [
+            F.scaled_dot_product_attention(
+                query[start : start + self.MAX_FUSED_BATCH],
+                key[start : start + self.MAX_FUSED_BATCH],
+                value[start : start + self.MAX_FUSED_BATCH],
+                dropout_p=0.0,
+                is_causal=self.mask,
+                scale=self.head_dim**-0.5,
+            )
+            for start in range(0, query.shape[0], self.MAX_FUSED_BATCH)
+        ]
+        # Один чанк -- обычный случай (всё, кроме temporal на CA и breadth на
+        # GBA). torch.cat даже из одного тензора аллоцирует и копирует полный
+        # выход внимания, а это сотни мегабайт на вызов.
+        out = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
 
-        if self.mask:
-            mask = torch.ones(
-                tgt_length, src_length, dtype=torch.bool, device=query.device
-            ).tril()  # lower triangular part of the matrix
-            attn_score.masked_fill_(~mask, -torch.inf)  # fill in-place
+        if pad:
+            out = out[..., : self.head_dim]
 
-        attn_score = torch.softmax(attn_score, dim=-1)
-        out = attn_score @ value  # (num_heads * batch_size, ..., tgt_length, head_dim)
-        out = torch.cat(
-            torch.split(out, batch_size, dim=0), dim=-1
-        )  # (batch_size, ..., tgt_length, head_dim * num_heads = model_dim)
+        # (batch, num_heads, tgt_length, head_dim) -> (..., tgt_length, model_dim)
+        out = out.transpose(1, 2).reshape(*leading_shape, tgt_length, self.model_dim)
 
         out = self.out_proj(out)
 
@@ -127,7 +171,20 @@ class STAEformer(nn.Module):
         num_layers=3,
         dropout=0.1,
         use_mixed_proj=True,
+        patch_index=None,
+        use_checkpoint=False,
     ):
+        """
+        patch_index : словарь из lib.spatial_patching, либо None.
+            Если задан, плотное внимание по узлам заменяется на пару
+            depth/breadth по патчам: стоимость падает с O(N^2) до O(M*(P+R)).
+            Это ДРУГАЯ модель, а не ускоренная версия прежней -- меняется то,
+            какие узлы видят друг друга, поэтому качество надо перемерять.
+        use_checkpoint : пересчитывать активации на обратном проходе вместо
+            хранения. Примерно -60% памяти за +30% времени. Патчинг сам по себе
+            память не экономит (M > N), так что этот флаг -- то, чем она
+            возвращается обратно.
+        """
         super().__init__()
 
         self.num_nodes = num_nodes
@@ -189,6 +246,69 @@ class STAEformer(nn.Module):
             ]
         )
 
+        self.use_checkpoint = use_checkpoint
+        self.patching = patch_index is not None
+
+        if self.patching:
+            gather_idx = torch.as_tensor(patch_index["gather_idx"], dtype=torch.long)
+            unpad_idx = torch.as_tensor(patch_index["unpad_idx"], dtype=torch.long)
+
+            if unpad_idx.numel() != num_nodes:
+                raise ValueError(
+                    f"индексы патчинга на {unpad_idx.numel()} узлов, "
+                    f"модель на {num_nodes}"
+                )
+
+            self.num_patches = int(patch_index["num_patches"])
+            self.patch_size = int(patch_index["patch_size"])
+            if self.num_patches * self.patch_size != gather_idx.numel():
+                raise ValueError("R * P не совпадает с числом слотов")
+
+            self.register_buffer("gather_idx", gather_idx)
+            self.register_buffer("unpad_idx", unpad_idx)
+
+            # attn_layers_s работает как depth (внутри патча), эти -- как
+            # breadth (между патчами). Их пара за слой даёт полную связность
+            # уже за два слоя: любой узел достижим по маршруту патч -> позиция.
+            self.attn_layers_s_breadth = nn.ModuleList(
+                [
+                    SelfAttentionLayer(
+                        self.model_dim, feed_forward_dim, num_heads, dropout
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+
+    def _apply_layer(self, layer, x, dim):
+        """Слой с опциональным пересчётом активаций на обратном проходе."""
+        if self.use_checkpoint and self.training and torch.is_grad_enabled():
+            return checkpoint(layer, x, dim, use_reentrant=False)
+        return layer(x, dim)
+
+    def _spatial_patched(self, x):
+        """Пространственное внимание по патчам вместо плотного по всем узлам.
+
+        Раскладка (batch, in_steps, num_patches, patch_size, model_dim):
+          dim=3 -- depth, длина P, ведущая размерность (B, T, R)
+          dim=2 -- breadth, длина R, ведущая размерность (B, T, P)
+
+        Слоты-паддинги участвуют во внимании как контекст, но на выходе
+        отбрасываются: unpad_idx указывает на слот, которым узел владеет.
+        """
+        batch_size, in_steps = x.shape[0], x.shape[1]
+
+        x = x.index_select(2, self.gather_idx)  # (batch, steps, num_slots, dim)
+        x = x.reshape(
+            batch_size, in_steps, self.num_patches, self.patch_size, self.model_dim
+        )
+
+        for depth, breadth in zip(self.attn_layers_s, self.attn_layers_s_breadth):
+            x = self._apply_layer(depth, x, 3)
+            x = self._apply_layer(breadth, x, 2)
+
+        x = x.reshape(batch_size, in_steps, -1, self.model_dim)
+        return x.index_select(2, self.unpad_idx)  # (batch, steps, num_nodes, dim)
+
     def forward(self, x):
         # x: (batch_size, in_steps, num_nodes, input_dim+tod+dow=3)
         batch_size = x.shape[0]
@@ -224,9 +344,13 @@ class STAEformer(nn.Module):
         x = torch.cat(features, dim=-1)  # (batch_size, in_steps, num_nodes, model_dim)
 
         for attn in self.attn_layers_t:
-            x = attn(x, dim=1)
-        for attn in self.attn_layers_s:
-            x = attn(x, dim=2)
+            x = self._apply_layer(attn, x, 1)
+
+        if self.patching:
+            x = self._spatial_patched(x)
+        else:
+            for attn in self.attn_layers_s:
+                x = self._apply_layer(attn, x, 2)
         # (batch_size, in_steps, num_nodes, model_dim)
 
         if self.use_mixed_proj:

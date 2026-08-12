@@ -255,6 +255,32 @@ SD:
   use_cl: false
   cl_step_size: 2500
 
+  # Пространственный патчинг по leaf-KDTree (arXiv:2412.09972).
+  # Убрать секцию целиком -> плотное внимание по узлам, как раньше.
+  #   recur   -- глубина дерева, листьев 2**recur
+  #   factors -- сколько соседних листьев склеивается в патч (степень двойки)
+  # Отсюда R = 2**recur / factors патчей по P = leaf_size * factors слотов.
+  # leaf_size не задан -> берётся минимально возможный, ceil(N / 2**recur).
+  #
+  # Важно: паддинг зависит ТОЛЬКО от recur, потому что
+  #   M = 2**recur * ceil(N / 2**recur).
+  # factors на M не влияет вообще, он лишь размен R против P при том же M.
+  # Меньше паддинга -> меньше активаций во всех пространственных слоях,
+  # так что recur стоит подбирать в первую очередь.
+  # Для SD: recur=8 дало бы M=768 (+7%) против нынешних 1024 (+43%).
+  # На SD патчинг почти ничего не даёт (внимание тут не доминирует), секция
+  # нужна как проверка, что механика не ломает качество.
+  patching:
+    meta: sd_meta.csv
+    recur: 9
+    factors: 32   # -> R=16, P=64, M=1024 (паддинг +43%)
+
+  # Выключен намеренно: пересчёт активаций стоит ровно 1.33x по времени
+  # (замерено на CA) и покупает память, которой на малых датасетах вдоволь --
+  # SD при batch 16 занимает около 6 ГБ из 80. Включать только при OOM, и это
+  # способ поднять батч, а не ускориться.
+  use_checkpoint: false
+
   model_args:
     num_nodes: 716
     in_steps: 12
@@ -275,3 +301,230 @@ SD:
     num_heads: 4
     num_layers: 3
     dropout: 0.1
+
+GBA:
+    num_nodes: 2352
+    in_steps: 12
+    out_steps: 12
+
+    train_size: 0.6
+    val_size: 0.2
+
+    time_of_day: true
+    day_of_week: true
+
+    lr: 0.001
+    weight_decay: 0.001
+
+    milestones:
+      - 15
+      - 35
+      - 50
+
+    lr_decay_rate: 0.1
+
+    batch_size: 16
+    max_epochs: 20
+    early_stop: 15
+
+    use_cl: false
+    cl_step_size: 2500
+
+    # 74% паддинга -- худший расклад из всех датасетов. Геометрия взята из
+    # PatchSTG как есть. Уменьшать надо recur, а не factors:
+    #   recur=11 -> M=4096 (+74%)   нынешний
+    #   recur=10 -> M=3072 (+31%)
+    #   recur= 9 -> M=2560  (+9%)   лучший по паддингу
+    # Качество на этих вариантах не мерено, поэтому пока их значения PatchSTG.
+    patching:
+      meta: gba_meta.csv
+      recur: 11
+      factors: 128   # -> R=16, P=256, M=4096 (паддинг +74%)
+
+    use_checkpoint: false
+
+    model_args:
+      num_nodes: 2352
+      in_steps: 12
+      out_steps: 12
+      steps_per_day: 288
+
+      input_dim: 3
+      output_dim: 1
+
+      input_embedding_dim: 24
+      tod_embedding_dim: 24
+      dow_embedding_dim: 24
+      spatial_embedding_dim: 0
+      adaptive_embedding_dim: 80
+
+      feed_forward_dim: 256
+      num_heads: 4
+      num_layers: 3
+      dropout: 0.1
+
+GLA:
+      num_nodes: 3834
+      in_steps: 12
+      out_steps: 12
+
+      train_size: 0.6
+      val_size: 0.2
+
+      time_of_day: true
+      day_of_week: true
+
+      lr: 0.001
+      weight_decay: 0.001
+
+      milestones:
+        - 15
+        - 35
+        - 50
+
+      lr_decay_rate: 0.1
+
+      # Было 8 из-за старой стены по памяти. С патчингом расход ~18.6 ГБ из 80,
+      # так что поднято до 16 -- как у SD и GBA. Единый батч по всем датасетам
+      # нужен, чтобы метрики между ними вообще можно было сопоставлять.
+      batch_size: 16
+      max_epochs: 20
+      early_stop: 15
+
+      use_cl: false
+      cl_step_size: 2500
+
+      # Самый удачный расклад: паддинг всего 7%, ускорение около 3.8x.
+      patching:
+        meta: gba_meta.csv   # файл назван gba_*, но внутри 3834 узла GLA
+        recur: 11
+        factors: 32   # -> R=64, P=64, M=4096 (паддинг +7%)
+
+      use_checkpoint: false
+
+      model_args:
+        num_nodes: 3834
+        in_steps: 12
+        out_steps: 12
+        steps_per_day: 288
+
+        input_dim: 3
+        output_dim: 1
+
+        input_embedding_dim: 24
+        tod_embedding_dim: 24
+        dow_embedding_dim: 24
+        spatial_embedding_dim: 0
+        adaptive_embedding_dim: 80
+
+        feed_forward_dim: 256
+        num_heads: 4
+        num_layers: 3
+        dropout: 0.1
+
+CA:
+    num_nodes: 8600
+    in_steps: 12
+    out_steps: 12
+
+    train_size: 0.6
+    val_size: 0.2
+
+    time_of_day: true
+    day_of_week: true
+
+    lr: 0.001
+    weight_decay: 0.001
+
+    # Один год данных, как у SD, GBA и GLA. Вехи и early_stop ОБЯЗАНЫ совпадать
+    # с ними, иначе метрики между датасетами несопоставимы: при max_epochs=20
+    # срабатывает только веха 15, то есть 75% обучения идёт на полном LR.
+    #
+    # Если когда-нибудь возьмём несколько лет -- пересчитывать по ШАГАМ
+    # оптимизатора, а не по эпохам. Веха 15 на одном годе = 118 215 шагов;
+    # на двух годах это эпоха 7.5, то есть milestones станут [8, 18, 25] при
+    # max_epochs 10. Менять надо и то и другое РАЗОМ: вехи [8,18,25] вместе с
+    # max_epochs 20 дают 40% обучения на полном LR вместо 75% и лишний сброс
+    # до 1e-5, которого не было ни в одном другом прогоне.
+    milestones:
+      - 15
+      - 35
+      - 50
+
+    lr_decay_rate: 0.1
+
+    # Замерено: 40 ГБ из 80, 0.4579 с/батч с патчингом и compile.
+    # 7881 батч в эпохе -> эпоха ровно час, 20 эпох ~20 часов.
+    # Батч 8, а не 16 как у остальных: при 16 без чекпойнтинга OOM на 78 ГБ.
+    batch_size: 8
+    max_epochs: 20
+    early_stop: 15
+
+    use_cl: false
+    cl_step_size: 2500
+
+    # ca_meta.csv в репозитории нет, он только на сервере. Нужны колонки
+    # ID, Lat, Lng и ровно 8600 строк в том же порядке, что узлы в data.npz --
+    # иначе патчи соберутся из случайных датчиков, и молча.
+    #
+    # recur=10, а НЕ 12 как в PatchSTG. Замерено на A100: 1.35x по времени,
+    # тогда как с их геометрией патчинг не даёт вообще ничего (1.03x к плотному
+    # вниманию, то есть шум).
+    # Два эффекта сразу. Паддинг падает с 43% до 7%, то есть из всех шести
+    # слоёв уходят 3000 фантомных узлов. И формы внимания становятся вменяемыми:
+    # 24 576 задач по 72x72 вместо 98 304 по 24x24 -- на таких огрызках слитые
+    # ядра тратят всё время на запуск, а не на счёт.
+    patching:
+      meta: ca_meta.csv
+      recur: 10
+      factors: 8   # -> R=128, P=72, M=9216 (паддинг +7%)
+
+    # Выключен: при batch 8 расход 40 ГБ из 80, память не жмёт. Замерено, что
+    # выключение даёт ровно 1.33x -- те самые лишние 30% на пересчёт.
+    #
+    # Если понадобится включить (batch 16 без него не проходит, OOM на 78 ГБ):
+    # активации считаются как ~13 тензоров (B*T*n, 152) в bf16, плюс 2 выхода
+    # LayerNorm -- под autocast они остаются в FP32, по 4 байта, -- плюс 2
+    # тензора FF шириной 256.
+    use_checkpoint: false
+
+    # torch.compile. false | default | reduce-overhead | max-autotune
+    #
+    # Зачем: замеры дали 9-11 TFLOP/s при пике A100 в 312, то есть ~3%. Упор
+    # не в арифметику, а в запуски ядер и обход памяти -- LayerNorm, dropout,
+    # residual, транспонирования, index_select. Их inductor и сливает.
+    #
+    # Замерено на CA: 1.48x, эпоха 1:29 -> 1:00. Самый крупный найденный рычаг
+    # и единственный, который не меняет модель.
+    #
+    # reduce-overhead проверен, дал 1.001x -- CUDA-графы не добавили ничего,
+    # так что берём default: проще и без требований к стабильности адресов.
+    # max-autotune не проверялся.
+    #
+    # ВАЖНО: Triton собирает свои утилиты обычным gcc, ему нужны заголовки
+    # Python. Без пакета python3.12-dev компиляция падает на Python.h.
+    # Обходной путь без root: apt-get download libpython3.12-dev, распаковать
+    # и добавить в CPATH ОБЕ директории -- .../include и .../include/python3.12
+    # (вторая даёт Python.h, первая разрешает вложенный x86_64-linux-gnu/...).
+    compile: default
+
+    model_args:
+      num_nodes: 8600
+      in_steps: 12
+      out_steps: 12
+      steps_per_day: 288
+
+      input_dim: 3
+      output_dim: 1
+
+      input_embedding_dim: 24
+      tod_embedding_dim: 24
+      dow_embedding_dim: 24
+      spatial_embedding_dim: 0
+      adaptive_embedding_dim: 80
+
+      feed_forward_dim: 256
+      num_heads: 4
+      num_layers: 3
+      dropout: 0.1
+
