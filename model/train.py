@@ -44,6 +44,72 @@ AMP_ENABLED = False
 AMP_DTYPE = torch.float16
 GRAD_SCALER = None
 
+# --------------------------------------------------------------------------- #
+# Распределённое обучение (DDP)
+#
+# Включается автоматически, когда процесс запущен через torchrun -- тот
+# выставляет RANK / LOCAL_RANK / WORLD_SIZE. Обычный запуск через python
+# ничего не меняет, все ветки ниже становятся тождественными.
+#
+# ВАЖНО про батч: batch_size из конфига трактуется как размер НА КАРТУ,
+# как принято в DDP. При двух картах эффективный батч удваивается, а число
+# шагов в эпохе вдвое падает -- значит milestones и max_epochs надо
+# пересчитывать. Фактические числа печатаются при старте.
+# --------------------------------------------------------------------------- #
+RANK = 0
+LOCAL_RANK = 0
+WORLD_SIZE = 1
+IS_DISTRIBUTED = False
+
+
+def _is_main():
+    return RANK == 0
+
+
+def _setup_distributed():
+    """Поднимает process group, если процесс запущен через torchrun."""
+    global RANK, LOCAL_RANK, WORLD_SIZE, IS_DISTRIBUTED, print_log
+
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return False
+
+    RANK = int(os.environ["RANK"])
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", RANK))
+    WORLD_SIZE = int(os.environ["WORLD_SIZE"])
+
+    if WORLD_SIZE <= 1:
+        return False
+
+    torch.cuda.set_device(LOCAL_RANK)
+    # Таймаут по умолчанию 10 минут, а первая компиляция torch.compile может
+    # занять больше и разъехаться по рангам -- тогда коллектив упал бы, не
+    # дождавшись отставшего. Час с запасом.
+    # device_id указываем явно: без него NCCL угадывает карту по глобальному
+    # рангу и предупреждает, что при неоднородной раскладке это может привести
+    # к зависанию на барьере.
+    torch.distributed.init_process_group(
+        backend="nccl",
+        timeout=datetime.timedelta(minutes=60),
+        device_id=torch.device(f"cuda:{LOCAL_RANK}"),
+    )
+    IS_DISTRIBUTED = True
+
+    # Печатает только нулевой ранг: иначе каждая строка лога задвоится,
+    # а файл лога откроют на запись сразу несколько процессов.
+    if not _is_main():
+        print_log = lambda *args, **kwargs: None  # noqa: E731
+
+    return True
+
+
+def _reduce_mean(value):
+    """Среднее значение по всем рангам. Вне DDP возвращает как есть."""
+    if not IS_DISTRIBUTED:
+        return value
+    tensor = torch.tensor([float(value)], device=DEVICE, dtype=torch.float64)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    return float(tensor.item() / WORLD_SIZE)
+
 # Сколько батчей ПОДРЯД с нечисловым лоссом терпеть, прежде чем падать.
 # Одиночный overflow в fp16 -- не повод ронять 30-часовой прогон, но серия
 # подряд означает, что обучение разошлось и продолжать бессмысленно.
@@ -58,8 +124,9 @@ def _unwrap_model(model):
     веса не загрузятся в обычную модель, а загруженные в скомпилированную --
     молча не найдут своих параметров. Разворачивать надо всегда.
     """
+    wrappers = (nn.DataParallel, nn.parallel.DistributedDataParallel)
     while True:
-        if isinstance(model, nn.DataParallel):
+        if isinstance(model, wrappers):
             model = model.module
         elif hasattr(model, "_orig_mod"):
             model = model._orig_mod
@@ -140,9 +207,25 @@ class MetricAccumulator:
             self.percentage_error += batch[3]
 
     def result(self):
-        """Возвращает (суммарные метрики, список по горизонтам)."""
+        """Возвращает (суммарные метрики, список по горизонтам).
+
+        Под DDP каждый ранг видел свою часть выборки, поэтому накопленные
+        суммы складываются по всем рангам. Метрики считаются из сумм, а не
+        усреднением средних -- иначе неравные размеры частей дали бы смещение.
+        """
         if self.count is None:
             raise ValueError("Метрики не накоплены: пустой загрузчик.")
+
+        if IS_DISTRIBUTED:
+            for tensor in (
+                self.count,
+                self.abs_error,
+                self.squared_error,
+                self.percentage_error,
+            ):
+                torch.distributed.all_reduce(
+                    tensor, op=torch.distributed.ReduceOp.SUM
+                )
 
         count = self.count.cpu()
         abs_error = self.abs_error.cpu()
@@ -193,6 +276,7 @@ def eval_model(model, valset_loader, criterion, epoch, max_epochs):
         dynamic_ncols=True,
         mininterval=1.0,
         leave=False,
+        disable=not _is_main(),
     )
 
     for batch_number, (x_batch, y_batch) in enumerate(progress, start=1):
@@ -220,7 +304,11 @@ def eval_model(model, valset_loader, criterion, epoch, max_epochs):
 
     all_metrics, step_metrics = accumulator.result()
 
-    return float(np.mean(batch_loss_list)), all_metrics, step_metrics
+    # Лосс усредняем по рангам: иначе early stopping и выбор лучшей эпохи
+    # приняли бы РАЗНЫЕ решения на разных рангах, и обучение разъехалось бы.
+    loss = _reduce_mean(float(np.mean(batch_loss_list)))
+
+    return loss, all_metrics, step_metrics
 
 
 def train_one_epoch(
@@ -246,6 +334,7 @@ def train_one_epoch(
         dynamic_ncols=True,
         mininterval=1.0,
         leave=False,
+        disable=not _is_main(),
     )
 
     for batch_number, (x_batch, y_batch) in enumerate(progress, start=1):
@@ -264,15 +353,31 @@ def train_one_epoch(
         # а не роняем прогон: с --resume и восстановленным RNG тот же батч
         # воспроизвёлся бы снова, и падение стало бы детерминированным циклом.
         # Падаем только если лосс нечисловой несколько батчей ПОДРЯД.
-        if not torch.isfinite(loss):
+        #
+        # ПОД DDP решение обязано быть ОБЩИМ. Батчи у рангов разные, поэтому
+        # лосс может оказаться нечисловым только на одном. Если он пропустит
+        # backward, а остальные нет, all-reduce градиентов спарятся не с теми
+        # -- градиенты молча перемешаются, а к концу эпохи ранги разойдутся по
+        # числу коллективов и NCCL повиснет до таймаута. Скаляр через MAX
+        # стоит копейки и делает ветвление симметричным по построению.
+        nonfinite = not bool(torch.isfinite(loss))
+        if IS_DISTRIBUTED:
+            flag = torch.tensor(
+                [1.0 if nonfinite else 0.0], device=DEVICE, dtype=torch.float32
+            )
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+            nonfinite = bool(flag.item() > 0)
+
+        if nonfinite:
             consecutive_nonfinite += 1
             skipped_batches += 1
-            tqdm.write(
-                f"WARNING: non-finite loss at epoch {epoch}, "
-                f"batch {batch_number} ({loss.item()}); "
-                f"skipping batch ({consecutive_nonfinite}/"
-                f"{MAX_CONSECUTIVE_NONFINITE} consecutive)"
-            )
+            if _is_main():
+                tqdm.write(
+                    f"WARNING: non-finite loss at epoch {epoch}, "
+                    f"batch {batch_number}; "
+                    f"skipping batch ({consecutive_nonfinite}/"
+                    f"{MAX_CONSECUTIVE_NONFINITE} consecutive)"
+                )
             if consecutive_nonfinite >= MAX_CONSECUTIVE_NONFINITE:
                 raise FloatingPointError(
                     f"Non-finite loss in {consecutive_nonfinite} consecutive "
@@ -313,7 +418,7 @@ def train_one_epoch(
             f"with non-finite loss."
         )
 
-    epoch_loss = float(np.mean(batch_loss_list))
+    epoch_loss = _reduce_mean(float(np.mean(batch_loss_list)))
     scheduler.step()
 
     return epoch_loss
@@ -337,6 +442,7 @@ def calculate_streaming_metrics(model, loader, description):
         dynamic_ncols=True,
         mininterval=1.0,
         leave=False,
+        disable=not _is_main(),
     )
 
     for batch_number, (x_batch, y_batch) in enumerate(progress, start=1):
@@ -466,8 +572,8 @@ def train(
     steps_per_day=None,
 ):
     """Train with early stopping, progress bars, timing and persistent history."""
-    model = model.to(DEVICE)
-
+    # .to(DEVICE) здесь НЕ делаем: модель уже на нужной карте (main), а
+    # перемещение уже обёрнутого DDP-модуля инвалидирует бакеты редьюсера.
     wait = 0
     min_val_loss = np.inf
     best_epoch = -1
@@ -514,6 +620,12 @@ def train(
         epoch = epoch_index + 1
         epoch_start = time.time()
 
+        # Без set_epoch DistributedSampler перемешивает выборку одинаково
+        # каждую эпоху, и модель видит один и тот же порядок все 7 эпох.
+        sampler = getattr(trainset_loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+
         train_loss = train_one_epoch(
             model=model,
             trainset_loader=trainset_loader,
@@ -547,7 +659,10 @@ def train(
             best_epoch = epoch
             best_state_dict = copy.deepcopy(_unwrap_model(model).state_dict())
 
-            if save:
+            # Пишет только нулевой ранг: веса на всех рангах одинаковы (DDP
+            # синхронизирует градиенты), а несколько процессов, пишущих в один
+            # файл, гарантированно его испортят.
+            if save and _is_main():
                 # Атомарно: обрыв во время записи не портит прошлый файл.
                 _atomic_torch_save(best_state_dict, save)
         else:
@@ -572,7 +687,7 @@ def train(
             }
         )
 
-        if history_path and plot_path:
+        if history_path and plot_path and _is_main():
             save_training_artifacts(
                 history=history,
                 history_path=history_path,
@@ -582,7 +697,9 @@ def train(
         # Полное состояние пишется КАЖДУЮ эпоху, а не только при улучшении:
         # возобновляться надо с того места, где прервались, а не с последнего
         # удачного. Веса лучшей эпохи лежат тут же отдельным ключом.
-        if resume_path:
+        # Под DDP пишет только нулевой ранг, остальные ждут его на барьере
+        # ниже -- чтобы никто не ушёл в следующую эпоху раньше записи.
+        if resume_path and _is_main():
             save_resume_state(
                 resume_path,
                 {
@@ -603,6 +720,12 @@ def train(
                     "rng": _capture_rng(),
                 },
             )
+
+        # Барьер после записи: остальные ранги не должны уйти в следующую
+        # эпоху, пока нулевой не дописал чекпойнт. Иначе при обрыве ровно в
+        # этот момент состояние на диске отстало бы от состояния в памяти.
+        if IS_DISTRIBUTED:
+            torch.distributed.barrier()
 
         if epoch % verbose == 0:
             marker = " *" if improved else ""
@@ -655,7 +778,9 @@ def train(
     # без единого улучшения (лучшая эпоха осталась в прошлом отрезке)
     # timestamped .pt этого прогона не был бы записан вовсе, а строка
     # "Saved Model: ..." указывала бы на несуществующий файл.
-    if save:
+    # Только ранг 0: имя файла содержит отметку времени, вычисленную в каждом
+    # процессе отдельно, и при совпадении секунды оба писали бы в один путь.
+    if save and _is_main():
         _atomic_torch_save(best_state_dict, save)
 
     # Суммируем по истории, а не по часам этого процесса: после возобновления
@@ -793,23 +918,44 @@ def main():
     )
     args = parser.parse_args()
 
+    # Под torchrun карты выбираются переменной CUDA_VISIBLE_DEVICES снаружи,
+    # а внутри каждый ранг берёт свою по LOCAL_RANK. Флаг -g в этом случае
+    # игнорируется -- иначе процессы передрались бы за одну карту.
+    distributed = _setup_distributed()
+
+    # Разный сид на ранг: с одинаковым оба применяли бы побитово одинаковые
+    # маски dropout, и эффективный батч регуляризовался бы одной маской вместо
+    # двух независимых. Веса при этом не разъедутся -- DDP броадкастит
+    # параметры от нулевого ранга при конструировании.
     seed = 42
-    seed_everything(seed)
+    seed_everything(seed + RANK)
     set_cpu_num(1)
 
-    gpu_ids = args.gpu_num
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
-
-    DEVICE = torch.device(
-        "cuda:0" if torch.cuda.is_available() else "cpu"
-    )
+    if distributed:
+        DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
+    else:
+        # setdefault, а не присваивание: заданный снаружи CUDA_VISIBLE_DEVICES
+        # важнее дефолта флага -g ("0,1"). Иначе запуск вида
+        #   CUDA_VISIBLE_DEVICES=2,3 python model/train.py -d CA
+        # молча уехал бы на физическую карту 0.
+        if args.gpu_num is not None:
+            os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.gpu_num)
+        DEVICE = torch.device(
+            "cuda:0" if torch.cuda.is_available() else "cpu"
+        )
 
     AMP_ENABLED = DEVICE.type == "cuda"
 
-    # bf16, если карта умеет (A100 умеет): тот же диапазон экспоненты, что у
-    # fp32, поэтому overflow активаций невозможен в принципе и GradScaler не
-    # нужен. fp16 остаётся запасным путём для старых карт.
-    if AMP_ENABLED and torch.cuda.is_bf16_supported():
+    # bf16, если карта умеет НАТИВНО: тот же диапазон экспоненты, что у fp32,
+    # поэтому overflow активаций невозможен в принципе и GradScaler не нужен.
+    #
+    # Проверяем поколение, а не is_bf16_supported(): на Turing (T4, SM 7.5)
+    # он возвращает True через программную эмуляцию, но нативных ядер нет,
+    # и часть операций просто падает. Нативный bf16 -- с Ampere, SM 8.0.
+    compute_capability = (
+        torch.cuda.get_device_capability(DEVICE) if AMP_ENABLED else (0, 0)
+    )
+    if AMP_ENABLED and compute_capability[0] >= 8:
         AMP_DTYPE = torch.bfloat16
     else:
         AMP_DTYPE = torch.float16
@@ -822,14 +968,21 @@ def main():
     )
 
     if DEVICE.type == "cuda":
-        # Disable the `math` SDPA backend. It materialises the full (..., N, N)
-        # score matrix, i.e. exactly the quadratic memory we are trying to avoid,
-        # and PyTorch falls back to it *silently* when the fast kernels are not
-        # eligible. With it off, an ineligible configuration raises instead of
-        # quietly burning tens of GB.
-        torch.backends.cuda.enable_math_sdp(False)
-        torch.backends.cuda.enable_flash_sdp(True)
+        # Бэкенд `math` материализует полную матрицу (..., N, N) -- ровно ту
+        # квадратичную память, от которой мы уходим, -- и PyTorch сваливается
+        # на него МОЛЧА, когда быстрые ядра неприменимы. Поэтому на картах, где
+        # flash доступен, мы его отключаем: неподходящая конфигурация тогда
+        # падает сразу, а не сжигает десятки гигабайт незаметно.
+        #
+        # Flash требует Ampere (SM 8.0+). На Turing (T4) и старше его нет, и
+        # без math не остаётся ни одного бэкенда -- SDPA падает с "Invalid
+        # backend". Там math приходится оставить; на малых графах вроде SD
+        # (716 узлов) квадратичная матрица всё равно копеечная.
+        flash_available = compute_capability[0] >= 8
+
+        torch.backends.cuda.enable_flash_sdp(flash_available)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(not flash_available)
 
     dataset = args.dataset.upper()
     data_path = os.path.join(REPO_DIR, "data", dataset)
@@ -860,12 +1013,26 @@ def main():
         if not os.path.isabs(meta_path):
             meta_path = os.path.join(data_path, meta_path)
 
-        patch_index = load_patch_index(
-            meta_path,
-            recur=patch_cfg["recur"],
-            factors=patch_cfg["factors"],
-            leaf_size=patch_cfg.get("leaf_size"),
-        )
+        # Кэш индексов строит и пишет только ранг 0: иначе процессы полезли бы
+        # в один .npz одновременно и оставили бы обрезанный файл. Остальные
+        # ждут на барьере и читают уже готовый.
+        if _is_main() or not distributed:
+            patch_index = load_patch_index(
+                meta_path,
+                recur=patch_cfg["recur"],
+                factors=patch_cfg["factors"],
+                leaf_size=patch_cfg.get("leaf_size"),
+            )
+        if distributed:
+            torch.distributed.barrier()
+            if not _is_main():
+                patch_index = load_patch_index(
+                    meta_path,
+                    recur=patch_cfg["recur"],
+                    factors=patch_cfg["factors"],
+                    leaf_size=patch_cfg.get("leaf_size"),
+                )
+
         model_args["patch_index"] = patch_index
 
     model_args["use_checkpoint"] = bool(cfg.get("use_checkpoint", False))
@@ -873,7 +1040,16 @@ def main():
     model = STAEformer(**model_args)
     model = model.to(DEVICE)
 
-    if DEVICE.type == "cuda" and torch.cuda.device_count() > 1:
+    if distributed:
+        # DDP оборачивается ДО torch.compile: dynamo видит обёртку и сам
+        # расставляет границы графа под all-reduce градиентов (DDPOptimizer).
+        # В обратном порядке компиляция и синхронизация мешают друг другу.
+        model = nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[LOCAL_RANK],
+            output_device=LOCAL_RANK,
+        )
+    elif DEVICE.type == "cuda" and torch.cuda.device_count() > 1:
         model = nn.DataParallel(
             model,
             device_ids=list(range(torch.cuda.device_count())),
@@ -902,8 +1078,8 @@ def main():
         if isinstance(model, nn.DataParallel):
             raise RuntimeError(
                 "torch.compile и DataParallel вместе не проверены: реплики "
-                "ломают кэш компиляции. Запускайте на одной карте или уберите "
-                "compile."
+                "ломают кэш компиляции. Для нескольких карт запускайте через "
+                "torchrun -- это путь DDP, он с компиляцией дружит."
             )
 
         # Разрешаем TF32 для тех матричных умножений, что остаются в fp32
@@ -944,7 +1120,14 @@ def main():
         f"{model_name}-{dataset}-resume.pt",
     )
 
-    log = open(log_path, "w", encoding="utf-8")
+    # Файл лога открывает на запись только нулевой ранг: иначе несколько
+    # процессов усекли бы его одновременно. На остальных print_log всё равно
+    # заглушён, так что им достаточно пустышки.
+    log = open(
+        log_path if _is_main() else os.devnull,
+        "w",
+        encoding="utf-8",
+    )
 
     try:
         print_log(f"Device: {DEVICE}", log=log)
@@ -963,7 +1146,10 @@ def main():
         print_log(
             "Multi-GPU: "
             + (
-                f"DataParallel on {torch.cuda.device_count()} GPUs"
+                f"DDP, {WORLD_SIZE} процессов (этот -- ранг {RANK}, "
+                f"карта cuda:{LOCAL_RANK})"
+                if IS_DISTRIBUTED
+                else f"DataParallel on {torch.cuda.device_count()} GPUs"
                 if isinstance(model, nn.DataParallel)
                 else "disabled"
             ),
@@ -979,6 +1165,18 @@ def main():
             ),
             log=log,
         )
+        if AMP_ENABLED:
+            print_log(
+                f"SDPA: compute capability {compute_capability[0]}."
+                f"{compute_capability[1]}, "
+                + (
+                    "flash доступен, math отключён"
+                    if compute_capability[0] >= 8
+                    else "flash НЕДОСТУПЕН (нужен Ampere), math оставлен "
+                    "запасным -- на больших графах он даст квадратичную память"
+                ),
+                log=log,
+            )
         print_log(dataset, log=log)
 
         (
@@ -992,8 +1190,21 @@ def main():
             dow=cfg.get("day_of_week"),
             batch_size=cfg.get("batch_size", 64),
             log=log,
+            distributed=distributed,
         )
         print_log(log=log)
+
+        if distributed:
+            steps_per_epoch = len(trainset_loader)
+            print_log(
+                f"DDP: {WORLD_SIZE} карт, batch_size {cfg['batch_size']} НА КАРТУ "
+                f"-> эффективный батч {cfg['batch_size'] * WORLD_SIZE}\n"
+                f"     шагов оптимизатора в эпохе: {steps_per_epoch} "
+                f"(на одной карте было бы {steps_per_epoch * WORLD_SIZE})\n"
+                f"     ВНИМАНИЕ: milestones и max_epochs считаются в эпохах, "
+                f"а эпоха стала короче в {WORLD_SIZE} раз -- проверьте расписание.",
+                log=log,
+            )
 
         if dataset in ("METRLA", "PEMSBAY"):
             criterion = MaskedMAELoss()
@@ -1157,6 +1368,15 @@ def main():
 
     finally:
         log.close()
+        if IS_DISTRIBUTED:
+            # try/except: если один ранг падает, пока другие сидят в
+            # коллективе, abort коммуникатора может подвиснуть сам. Ронять
+            # процесс на выходе из-за этого незачем -- torchrun всё равно
+            # прибьёт остальных.
+            try:
+                torch.distributed.destroy_process_group()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

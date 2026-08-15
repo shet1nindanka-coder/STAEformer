@@ -119,6 +119,7 @@ def get_dataloaders_from_index_data(
     dom=False,
     batch_size=64,
     log=None,
+    distributed=False,
 ):
     data_path = os.path.join(
         data_dir,
@@ -212,21 +213,48 @@ def get_dataloaders_from_index_data(
         "pin_memory": torch.cuda.is_available(),
     }
 
+    if distributed:
+        # Каждый ранг видит свою непересекающуюся часть выборки. Для train
+        # перемешивание делает сам сампler, поэтому shuffle у загрузчика
+        # обязан быть False -- иначе DataLoader упадёт.
+        #
+        # DistributedSampler добивает выборку до кратности world_size,
+        # повторяя несколько первых элементов. На валидации это значит, что
+        # до world_size-1 окон посчитаются дважды: из 63 тысяч это тысячные
+        # доли процента, метрики не сдвинет.
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            trainset,
+            shuffle=True,
+        )
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            valset,
+            shuffle=False,
+        )
+        test_sampler = torch.utils.data.distributed.DistributedSampler(
+            testset,
+            shuffle=False,
+        )
+    else:
+        train_sampler = val_sampler = test_sampler = None
+
     trainset_loader = torch.utils.data.DataLoader(
         trainset,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         **loader_args,
     )
 
     valset_loader = torch.utils.data.DataLoader(
         valset,
         shuffle=False,
+        sampler=val_sampler,
         **loader_args,
     )
 
     testset_loader = torch.utils.data.DataLoader(
         testset,
         shuffle=False,
+        sampler=test_sampler,
         **loader_args,
     )
 
