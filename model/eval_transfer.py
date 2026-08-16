@@ -208,6 +208,14 @@ def main():
             "Прогоните один раз на сервере, где лежит CA."
         ),
     )
+    p.add_argument(
+        "--use-last",
+        action="store_true",
+        help=(
+            "для resume-файла взять последние веса вместо лучших по валидации. "
+            "Нужно, только если интересует именно состояние на момент обрыва."
+        ),
+    )
     p.add_argument("--batch-size", type=int)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--log", help="файл лога")
@@ -232,7 +240,21 @@ def main():
 
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     if isinstance(state, dict) and "model" in state and "optimizer" in state:
-        state = state["model"]  # файл состояния для --resume, а не голые веса
+        # Файл возобновления, а не голые веса. По умолчанию берём ЛУЧШИЕ по
+        # валидации, а не последние: "model" -- это состояние на момент
+        # прерывания, оно может быть хуже.
+        print_log(
+            f"Файл возобновления: эпоха {state.get('epoch')}, "
+            f"лучшая {state.get('best_epoch')}, "
+            f"датасет {state.get('dataset')}",
+            log=log,
+        )
+        if args.use_last or not state.get("best_state_dict"):
+            state = state["model"]
+            print_log("Взяты последние веса (model).", log=log)
+        else:
+            state = state["best_state_dict"]
+            print_log("Взяты лучшие по валидации веса (best_state_dict).", log=log)
     transfer_state(state, model, rows, log)
 
     batch_size = args.batch_size or dst_cfg.get("batch_size", 64)

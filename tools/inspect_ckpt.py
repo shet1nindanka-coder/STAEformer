@@ -21,9 +21,27 @@ import zipfile
 
 
 class _Stub:
-    """Заглушка вместо любого класса из torch."""
+    """Заглушка вместо любого класса из torch.
+
+    Обязана молча проглатывать любое восстановление состояния. В файлах
+    возобновления (--resume) лежат состояния оптимизатора, планировщика и
+    RNG, и pickle кладёт их через __setstate__/append/__setitem__. Без этих
+    методов C-реализация pickle падает с "state is not a dictionary".
+    """
 
     def __init__(self, *a, **kw):
+        pass
+
+    def __setstate__(self, state):
+        pass
+
+    def append(self, *a):
+        pass
+
+    def extend(self, *a):
+        pass
+
+    def __setitem__(self, *a):
         pass
 
 
@@ -60,11 +78,16 @@ def read_state(path):
 def describe(path):
     obj = read_state(path)
 
-    # Файл возобновления (--resume) хранит веса под ключом "model".
-    kind = "веса"
+    # Файл возобновления (--resume) хранит и последние веса ("model"), и
+    # лучшие по валидации ("best_state_dict"), плюс номер эпохи и датасет.
+    kind, epoch, best_epoch, tag = "веса", None, None, None
     if isinstance(obj, dict) and "optimizer" in obj and "model" in obj:
         kind = "resume"
-        obj = obj["model"]
+        epoch = obj.get("epoch")
+        best_epoch = obj.get("best_epoch")
+        tag = obj.get("dataset")
+        # Смотрим на лучшие веса: именно их берёт eval_transfer.py.
+        obj = obj.get("best_state_dict") or obj["model"]
 
     if not isinstance(obj, dict):
         return {"файл": os.path.basename(path), "ошибка": "не похоже на state_dict"}
@@ -83,7 +106,9 @@ def describe(path):
         "файл": os.path.basename(path),
         "тип": kind,
         "узлов": nodes,
-        "датасет": known.get(nodes, "?"),
+        "датасет": known.get(nodes) or tag or "?",
+        "эпоха": epoch,
+        "best": best_epoch,
         "in_steps": steps,
         "внимание": "патчинг" if any("breadth" in k for k in keys) else "плотное",
         "compile": "да" if any("_orig_mod" in k for k in keys) else "нет",
@@ -118,7 +143,8 @@ def main():
         except Exception as exc:
             rows.append({"файл": os.path.basename(f), "ошибка": str(exc)[:60]})
 
-    cols = ["файл", "датасет", "узлов", "внимание", "compile", "тип", "МБ", "ошибка"]
+    cols = ["файл", "датасет", "узлов", "внимание", "compile", "тип",
+            "эпоха", "best", "МБ", "ошибка"]
     cols = [c for c in cols if any(r.get(c) is not None for r in rows)]
     width = {c: max(len(c), max(len(str(r.get(c, "-"))) for r in rows)) for c in cols}
 
